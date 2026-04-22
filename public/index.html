@@ -1,11 +1,858 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>HomeIQ Planner</title>
-  </head>
-  <body>
-    <div id="root"></div>
-  </body>
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>HomeIQ Planner</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.10.3/Recharts.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0A0E1A; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+// App code
+const { useState, useMemo } = React;
+const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } = Recharts;
+
+// ─── THEME ────────────────────────────────────────────────────────────────────
+const C = {
+  bg:"#0A0E1A", card:"#141B2D", border:"#1E2D45",
+  accent:"#00D4AA", accentDim:"#00D4AA22", gold:"#F5C842",
+  red:"#FF5757", blue:"#4A9EFF", text:"#F0F4FF", muted:"#8899BB", inputBg:"#0D1526",
+};
+
+// ─── PURE MATH (all verified cell-by-cell against Excel) ─────────────────────
+const n   = v => parseFloat(v) || 0;
+const fmt = v => new Intl.NumberFormat("en-CA",{style:"currency",currency:"CAD",maximumFractionDigits:0}).format(v??0);
+const fmtPct = v => `${((v??0)*100).toFixed(2)}%`;
+const r100 = v => Math.round(v/100)*100;   // ROUND(-2)
+const r5   = v => Math.round(v/5)*5;
+const ceil = v => Math.ceil(v);            // ROUNDUP(...,0)
+
+// Canadian semi-annual compounding rate per payment period (Excel BP16 formula)
+const canadianRate = (annual, ppy=12) => Math.pow(1 + annual/2, 2/ppy) - 1;
+
+// PMT using Canadian rate
+function canadianPmt(principal, annualRate, amortYears, ppy=12) {
+  if (!principal || !annualRate) return 0;
+  const r = canadianRate(annualRate, ppy);
+  const nper = amortYears * ppy;
+  return Math.round(principal * r / (1 - Math.pow(1+r,-nper)) * 100) / 100;
+}
+
+// Excel FV(rate, nper, pmt, pv, 0) — annual compounding (AL3 is annual rate, nper=years)
+// FV = -pv*(1+rate)^nper - pmt*((1+rate)^nper - 1)/rate
+function excelFV(rate, nper, pmt, pv) {
+  if (rate === 0) return -pv - pmt * nper;
+  return -pv * Math.pow(1+rate, nper) - pmt * (Math.pow(1+rate, nper) - 1) / rate;
+}
+
+// CMHC — AK19 formula exactly:
+// IF(amort<=25): 5-9.99%→4%, 10-14.99%→3.1%, 15-19.99%→2.8%
+// IF(amort>25):  5-9.99%→4.2%, 10-14.99%→3.3%, 15-19.99%→3.0%
+// Base = homePrice - downPayment (AU8)
+function calcCMHC(price, down, amort) {
+  const dpPct = down / price;
+  if (dpPct >= 0.20 || dpPct < 0.05) return 0;
+  const base = price - down;
+  if (amort <= 25) {
+    if (dpPct <= 0.0999) return base * 0.040;
+    if (dpPct <= 0.1499) return base * 0.031;
+    return base * 0.028;
+  } else {
+    if (dpPct <= 0.0999) return base * 0.042;
+    if (dpPct <= 0.1499) return base * 0.033;
+    return base * 0.030;
+  }
+}
+
+// Min down payment — AV22 formula exactly:
+// IF(E9<=500000, 5%*E9, IF(AND(E9>500000, E9<=1499999), 25000+10%*(E9-500000), IF(E9>=1500000, 20%*E9)))
+function minDown(price) {
+  if (price <= 500000)  return price * 0.05;
+  if (price <= 1499999) return 25000 + (price - 500000) * 0.10;
+  return price * 0.20;
+}
+
+// Stress test rate
+const stressRate = r => Math.max(r + 0.02, 0.0525);
+
+// Build yearly amort summary — uses ROUNDUP(SUM(...)) as in T40:U40 formula
+function buildYearlySummary(principal, annualRate, amortYears) {
+  const r = canadianRate(annualRate);
+  const pmt = canadianPmt(principal, annualRate, amortYears);
+  let balance = principal;
+  let cumInt = 0, cumPrin = 0;
+  const rows = [];
+  for (let yr = 1; yr <= amortYears; yr++) {
+    for (let m = 0; m < 12; m++) {
+      const intPmt = Math.round(r * balance * 100) / 100;
+      const prinPmt = (balance - (pmt - intPmt) < 0) ? balance : pmt - intPmt;
+      cumInt  += intPmt;
+      cumPrin += prinPmt;
+      balance  = Math.max(0, balance - prinPmt);
+    }
+    rows.push({ year: yr, principalPaid: ceil(cumPrin), interestPaid: ceil(cumInt) });
+  }
+  return rows;
+}
+
+// Full payment-by-payment schedule for Amort tab
+function buildFullSchedule(principal, annualRate, amortYears, termYears, freqKey="Monthly", extraPmt=0, extraInterval="Monthly") {
+  const freqMap = {
+    "Monthly":       {ppy:12},
+    "Semi-Monthly":  {ppy:24},
+    "Bi-Weekly":     {ppy:26},
+    "Weekly":        {ppy:52},
+    "Acc Bi-Weekly": {ppy:26, acc:true, base:12},
+    "Acc Weekly":    {ppy:52, acc:true, base:12},
+  };
+  const freq = freqMap[freqKey] || freqMap["Monthly"];
+  const ppy = freq.ppy;
+
+  let scheduledPmt;
+  if (freq.acc) {
+    const monthlyPmt = canadianPmt(principal, annualRate, amortYears, 12);
+    scheduledPmt = freqKey === "Acc Bi-Weekly"
+      ? Math.round(monthlyPmt / 2 * 100) / 100
+      : Math.round(monthlyPmt / 4 * 100) / 100;
+  } else {
+    scheduledPmt = canadianPmt(principal, annualRate, amortYears, ppy);
+  }
+
+  const extraEvery = extraInterval === "Annually" ? ppy : extraInterval === "Bi-Weekly" ? Math.round(ppy/26)*2 : Math.round(ppy/12);
+  const termN = termYears * ppy;
+  let balance = principal;
+  let cumInt = 0, cumPrin = 0;
+  const payments = [];
+
+  for (let i = 1; i <= amortYears * ppy; i++) {
+    if (balance < 0.005) break;
+    const r = canadianRate(annualRate, ppy);
+    const intPmt = Math.round(r * balance * 100) / 100;
+    let thisPmt = Math.min(scheduledPmt, balance + intPmt);
+    if (i === amortYears * ppy) thisPmt = balance + intPmt;
+    const extra = (extraPmt > 0 && i % extraEvery === 0) ? Math.min(extraPmt, balance + intPmt - thisPmt) : 0;
+    const prinPmt = thisPmt - intPmt;
+    cumInt  += intPmt;
+    cumPrin += prinPmt + extra;
+    balance  = Math.max(0, balance - prinPmt - extra);
+    if (i <= termN || balance < 0.005) {
+      payments.push({ num:i, payment:thisPmt, extra, interest:intPmt, principal:prinPmt, balance });
+    }
+    if (balance < 0.005) break;
+  }
+
+  const termPayments = payments.filter(p => p.num <= termN);
+  const termBalance  = termPayments.length ? termPayments[termPayments.length-1].balance : 0;
+  const termInterest = termPayments.reduce((s,p)=>s+p.interest,0);
+  const termPrin     = termPayments.reduce((s,p)=>s+p.principal+p.extra,0);
+  const totalInterest = payments.reduce((s,p)=>s+p.interest,0);
+  const actualN = payments.length;
+
+  // Yearly chart
+  const yearlyChart = {};
+  payments.forEach(p => {
+    const yr = Math.ceil(p.num / ppy);
+    if (!yearlyChart[yr]) yearlyChart[yr] = {year:yr, interest:0, principal:0, extra:0};
+    yearlyChart[yr].interest  += p.interest;
+    yearlyChart[yr].principal += p.principal;
+    yearlyChart[yr].extra     += p.extra;
+  });
+
+  return {scheduledPmt, ppy, termBalance, termInterest, termPrin, totalInterest, actualN,
+          nper: amortYears * ppy, payments: payments.slice(0,500),
+          yearlyChart: Object.values(yearlyChart)};
+}
+
+// ─── RENT VS BUY ENGINE ───────────────────────────────────────────────────────
+// All formulas verified against Excel, every year matches exactly
+function calcRVB(p) {
+  const { homePrice, downPayment, interestRate, amortization,
+    buyerUtils, homeIns, condoFee,
+    hasRental, rentalMonthly, vacancyRate,
+    rentMonthly, rentIncrease, renterUtils, investableDiff,
+    investReturn, homeAppreciation, timeHorizon } = p;
+
+  const cmhc = calcCMHC(homePrice, downPayment, amortization);
+  const mortgage = homePrice - downPayment + cmhc;
+  const closingCosts = homePrice * 0.02;  // AD51 = D6*2%
+  const scheduledPmt = canadianPmt(mortgage, interestRate, amortization);
+
+  // Yearly amortization using ROUNDUP cumulative (mirrors T40:U40 array formula)
+  const amortRows = buildYearlySummary(mortgage, interestRate, amortization);
+
+  const rows = [];
+  for (let yr = 1; yr <= amortization; yr++) {
+    const a = amortRows[yr - 1] || { principalPaid: 0, interestPaid: 0 };
+
+    // Home value: ROUND(homePrice*(1+appre)^yr, -2)  — AM89 formula
+    const homeValue   = r100(homePrice * Math.pow(1 + homeAppreciation, yr));
+    const equityAppr  = homeValue - homePrice;  // AN89
+
+    // Selling costs: homeValue * Z4(0.05)  — AU89 formula
+    const sellingCosts = r5(homeValue * 0.05);
+
+    // Cumulative costs
+    const maintenance = homePrice * 0.01 * yr;       // AR89: 1%/yr
+    const propTax     = homePrice * 0.0075 * yr;     // AS89: 0.75%/yr
+    const condoPaid   = condoFee * 12 * yr;          // AT89
+    const utilsPaid   = buyerUtils * 12 * yr;        // BI89
+    const insPaid     = homeIns * 12 * yr;           // BJ89
+    const rentalInc   = hasRental ? rentalMonthly * 12 * (1 - vacancyRate) * yr : 0; // AO89
+
+    // AO35 (Total Equity) = equityAppr + principalPaid + downPayment
+    const totalEquity = equityAppr + a.principalPaid + downPayment;  // AO35
+
+    // AO33 (Total Housing Cost) = interest + closing + maintenance + propTax + condoFees + utils + ins - rental
+    const totalCost = a.interestPaid + closingCosts + maintenance + propTax + condoPaid + utilsPaid + insPaid - rentalInc; // AO33
+
+    // AO37 = Net Worth Change BEFORE selling = AO35 - AO33  (shown in top summary)
+    const netWorthChange = Math.round(totalEquity - totalCost);  // AO37 = 34433 at yr5
+
+    // AA (per AN51 year-table formula) = DP + equityAppr + principal + rental - interest - maintenance - propTax - condoFees
+    const AA = downPayment + equityAppr + a.principalPaid + rentalInc
+               - a.interestPaid - maintenance - propTax - condoPaid;
+    // AN51 = Net Buy AFTER selling = AA - closingCosts - sellingCosts - utilities - homeInsurance
+    const netBuy = Math.round(AA - closingCosts - sellingCosts - utilsPaid - insPaid);
+
+    // Investment value: R8 = ROUND(FV(AL3, Years, -(D32*12), -D8, 0), -2)
+    // Excel pmt = -(D32*12) — NEGATIVE because cash flows out to investment
+    // AR35 = J6 = R8 — all point to the same FV formula which INCLUDES investable diff
+    // BC89 (year table) uses identical formula: ROUND(FV(AL3, yr, -(D32*12), -D8, 0), -2)
+    const invValue = r100(excelFV(investReturn, yr, -(investableDiff * 12), -downPayment));
+
+    // Rent paid (AW89 = AG20 = S23): ROUNDUP(rent*12*((1+g)^yr-1)/g + renterUtils*12*yr, 0)
+    const g = rentIncrease;
+    const rentPaid = g === 0
+      ? ceil(rentMonthly * 12 * yr + renterUtils * 12 * yr)
+      : ceil(rentMonthly * 12 * ((1+g)**yr - 1) / g + renterUtils * 12 * yr);
+
+    // Net Rent = invValue - rentPaid (AR37 = AR35 - AR33 = R8 - AG20, same formula for both summary and table)
+    const netRent = Math.round(invValue - rentPaid);
+
+    const diff = netBuy - netRent;
+
+    rows.push({
+      year: yr, homeValue, equityAppr,
+      principalPaid: a.principalPaid, interestPaid: a.interestPaid,
+      maintenance: Math.round(maintenance), propTax: Math.round(propTax),
+      sellingCosts, utilsPaid: Math.round(utilsPaid), insPaid: Math.round(insPaid),
+      condoPaid: Math.round(condoPaid), rentalInc: Math.round(rentalInc),
+      totalEquity: Math.round(totalEquity),   // AO35
+      netWorthChange,                          // AO37 = before selling
+      netBuy,                                  // AN51 = after selling
+      invValue, rentPaid, netRent,             // AR35, AR33, AR37
+      diff, outcome: diff > 0 ? "BUY" : diff < 0 ? "RENT" : "EVEN",
+    });
+  }
+
+  const breakEvenYear = rows.find(r => r.outcome === "BUY")?.year ?? null;
+  const horizonRow    = rows.find(r => r.year === timeHorizon) ?? rows[rows.length - 1];
+
+  return { rows, horizonRow, breakEvenYear, scheduledPmt, mortgage, cmhc, closingCosts };
+}
+
+// ─── PRE-APPROVAL ENGINE ──────────────────────────────────────────────────────
+function calcPA(income, debt, dp, rate, amort, propTax, heating, condo) {
+  const sr = stressRate(rate);
+  const mInc = income / 12;
+  const housingCosts = propTax + heating + condo;
+  const maxQGDS = mInc * 0.39 - housingCosts;
+  const maxQTDS = mInc * 0.44 - housingCosts - debt;
+  const maxQ = Math.min(maxQGDS, maxQTDS);
+  const srRate = canadianRate(sr, 12);
+  const nper   = amort * 12;
+  const maxMortgage = maxQ > 0 ? maxQ * (1 - Math.pow(1+srRate, -nper)) / srRate : 0;
+  const maxPrice    = maxMortgage + dp;
+  const actualPmt   = canadianPmt(Math.max(0, maxMortgage), rate, amort);
+  const qualPmt     = canadianPmt(Math.max(0, maxMortgage), sr,   amort);
+  const gds = (qualPmt + housingCosts) / mInc;
+  const tds = (qualPmt + housingCosts + debt) / mInc;
+  return { maxMortgage, maxPrice, actualPmt, qualPmt, gds, tds, sr,
+           md: minDown(maxPrice), cmhc: calcCMHC(maxPrice, dp, amort),
+           closingCosts: maxPrice * 0.02 + 1450 };
+}
+
+// ─── SHARED STYLES ────────────────────────────────────────────────────────────
+const S = {
+  app:  { minHeight:"100vh", background:C.bg, color:C.text, fontFamily:"'DM Sans',sans-serif" },
+  hdr:  { background:`linear-gradient(135deg,${C.card},#0D1A2E)`, borderBottom:`1px solid ${C.border}`,
+           padding:"16px 28px", display:"flex", alignItems:"center", justifyContent:"space-between" },
+  logo: { width:36, height:36, borderRadius:8, background:`linear-gradient(135deg,${C.accent},#0099FF)`,
+           display:"flex", alignItems:"center", justifyContent:"center", fontSize:16, fontWeight:800, color:"#fff" },
+  tabs: { display:"flex", gap:4, background:C.inputBg, borderRadius:10, padding:4 },
+  tab:  a => ({ padding:"7px 18px", borderRadius:8, fontSize:13, fontWeight:600, cursor:"pointer",
+                border:"none", transition:"all .2s", background:a?C.accent:"transparent", color:a?C.bg:C.muted }),
+  main: { maxWidth:1260, margin:"0 auto", padding:"24px 18px" },
+  grid: { display:"grid", gridTemplateColumns:"360px 1fr", gap:20, alignItems:"start" },
+  card: { background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:20, marginBottom:16 },
+  sec:  { fontSize:11, fontWeight:700, color:C.muted, textTransform:"uppercase", letterSpacing:1, marginBottom:13 },
+  lbl:  { fontSize:12, fontWeight:600, color:C.muted, marginBottom:4, display:"block" },
+  inp:  { width:"100%", background:C.inputBg, border:`1px solid ${C.border}`, borderRadius:8,
+           padding:"8px 11px", color:C.text, fontSize:13, outline:"none", boxSizing:"border-box" },
+  sel:  { width:"100%", background:C.inputBg, border:`1px solid ${C.border}`, borderRadius:8,
+           padding:"8px 11px", color:C.text, fontSize:13, outline:"none" },
+  r2:   { display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 },
+  r3:   { display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 },
+  div:  { borderTop:`1px solid ${C.border}`, margin:"14px 0" },
+  box:  c => ({ background:`${c}12`, border:`1px solid ${c}33`, borderRadius:12, padding:"12px 16px" }),
+  g2:   { display:"grid", gridTemplateColumns:"1fr 1fr", gap:11, marginBottom:14 },
+  g3:   { display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:11, marginBottom:14 },
+  info: { background:C.inputBg, borderRadius:8, padding:"8px 12px", fontSize:12, color:C.muted,
+           lineHeight:1.6, marginBottom:11 },
+  pill: c => ({ display:"inline-block", background:`${c}22`, border:`1px solid ${c}44`,
+                color:c, borderRadius:20, padding:"2px 10px", fontSize:11, fontWeight:700 }),
+  th:   l => ({ padding:"8px 10px", background:C.inputBg, color:C.muted, fontWeight:600,
+                textAlign:l?"left":"right", borderBottom:`1px solid ${C.border}`,
+                whiteSpace:"nowrap", fontSize:11, position:"sticky", top:0 }),
+  td:   (c,l) => ({ padding:"6px 10px", borderBottom:`1px solid ${C.border}14`,
+                    textAlign:l?"left":"right", color:c||C.text, fontSize:11 }),
+  tog:  a => ({ padding:"5px 13px", borderRadius:6, fontSize:12, fontWeight:600, cursor:"pointer",
+                border:`1px solid ${a?C.accent:C.border}`, background:a?C.accentDim:"transparent",
+                color:a?C.accent:C.muted }),
+};
+
+function Field({ label, value, onChange, prefix, suffix, step="any", min=0 }) {
+  return (
+    <div style={{marginBottom:11}}>
+      {label && <label style={S.lbl}>{label}</label>}
+      <div style={{position:"relative",display:"flex",alignItems:"center"}}>
+        {prefix && <span style={{position:"absolute",left:10,color:C.muted,fontSize:12,pointerEvents:"none"}}>{prefix}</span>}
+        <input type="number" step={step} min={min} value={value}
+          onChange={e=>onChange(e.target.value)}
+          style={{...S.inp,paddingLeft:prefix?22:11,paddingRight:suffix?34:11}} />
+        {suffix && <span style={{position:"absolute",right:10,color:C.muted,fontSize:12,pointerEvents:"none"}}>{suffix}</span>}
+      </div>
+    </div>
+  );
+}
+
+function Sel({ label, value, onChange, options }) {
+  return (
+    <div style={{marginBottom:11}}>
+      {label && <label style={S.lbl}>{label}</label>}
+      <select value={value} onChange={e=>onChange(e.target.value)} style={S.sel}>
+        {options.map(o=><option key={o} value={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+}
+
+const Tip = ({active,payload,label}) => {
+  if (!active||!payload?.length) return null;
+  return (
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",fontSize:12}}>
+      <div style={{color:C.muted,marginBottom:5,fontWeight:700}}>Year {label}</div>
+      {payload.map((p,i)=>(
+        <div key={i} style={{color:p.color,marginBottom:2}}>{p.name}: <strong>{fmt(p.value)}</strong></div>
+      ))}
+    </div>
+  );
+};
+
+// ─── RENT VS BUY TAB ──────────────────────────────────────────────────────────
+function RVBTab() {
+  const [p, setP] = useState({
+    homePrice:650000, downPayment:65000, interestRate:4, amortization:25,
+    buyerUtils:300, homeIns:200, condoFee:0,
+    hasRental:false, rentalMonthly:1800, vacancyRate:5,
+    rentMonthly:2400, rentIncrease:2, renterUtils:250, investableDiff:0,
+    investReturn:7, homeAppreciation:3, timeHorizon:5,
+  });
+  const s = k => v => setP(prev => ({...prev,[k]:v}));
+
+  const np = useMemo(() => ({
+    homePrice:n(p.homePrice), downPayment:n(p.downPayment),
+    interestRate:n(p.interestRate)/100, amortization:Math.max(1,n(p.amortization)),
+    buyerUtils:n(p.buyerUtils), homeIns:n(p.homeIns), condoFee:n(p.condoFee),
+    hasRental:p.hasRental, rentalMonthly:n(p.rentalMonthly), vacancyRate:n(p.vacancyRate)/100,
+    rentMonthly:n(p.rentMonthly), rentIncrease:n(p.rentIncrease)/100,
+    renterUtils:n(p.renterUtils), investableDiff:n(p.investableDiff),
+    investReturn:n(p.investReturn)/100, homeAppreciation:n(p.homeAppreciation)/100,
+    timeHorizon:Math.min(n(p.timeHorizon), Math.max(1,n(p.amortization))),
+  }), [p]);
+
+  const { rows, horizonRow, breakEvenYear, scheduledPmt, mortgage, cmhc, closingCosts } =
+    useMemo(() => calcRVB(np), [np]);
+
+  const winner = horizonRow?.outcome ?? "BUY";
+  const hor = np.timeHorizon;
+
+  return (
+    <div style={S.grid}>
+      {/* ── INPUTS ─────────────────────────────────────── */}
+      <div>
+        <div style={S.card}>
+          <div style={S.sec}>🏠 Home Purchase</div>
+          <Field label="Home Price" value={p.homePrice} onChange={s("homePrice")} prefix="$" />
+          <div style={{...S.info,marginTop:-5}}>
+            Min. Down Payment Required: <strong style={{color:n(p.downPayment)>=minDown(n(p.homePrice))?C.accent:C.red}}>{fmt(minDown(n(p.homePrice)))}</strong>
+            {n(p.downPayment) < minDown(n(p.homePrice)) && <span style={{color:C.red}}> ← your down payment is below minimum</span>}
+          </div>
+          <Field label="Down Payment" value={p.downPayment} onChange={s("downPayment")} prefix="$" />
+          <div style={S.info}>
+            Mortgage: <strong style={{color:C.accent}}>{fmt(mortgage)}</strong>
+            {cmhc>0 && <span style={{color:C.muted}}> (CMHC: {fmt(cmhc)})</span>}<br/>
+            Monthly Payment: <strong style={{color:C.gold}}>{fmt(scheduledPmt)}/mo</strong><br/>
+            Closing Costs (2%): <strong>{fmt(closingCosts)}</strong>
+          </div>
+          <div style={S.r2}>
+            <Field label="Interest Rate" value={p.interestRate} onChange={s("interestRate")} suffix="%" step="0.01" />
+            <Field label="Amortization (yrs)" value={p.amortization} onChange={s("amortization")} step="1" min={1} />
+          </div>
+          {n(p.amortization)>25 && (
+            <div style={{...S.info,color:C.gold,fontSize:11}}>
+              ⚠️ Amortization &gt;25 yrs: CMHC rates increase (5-9.99%→4.2%, 10-14.99%→3.3%, 15-19.99%→3.0%)
+            </div>
+          )}
+
+          <div style={S.div}/>
+          <div style={S.sec}>🏡 Monthly Ownership Costs</div>
+          <div style={{...S.info,color:C.muted}}>
+            📋 Property Tax is calculated as <strong style={{color:C.text}}>0.75% of home price per year</strong>
+            &nbsp;= <strong style={{color:C.accent}}>{fmt(n(p.homePrice) * 0.0075 / 12)}/mo</strong>
+            &nbsp;· <strong style={{color:C.accent}}>{fmt(n(p.homePrice) * 0.0075)}/yr</strong>
+          </div>
+          <div style={S.r2}>
+            <Field label="Utilities /mo" value={p.buyerUtils} onChange={s("buyerUtils")} prefix="$" />
+            <Field label="Home Insurance /mo" value={p.homeIns} onChange={s("homeIns")} prefix="$" />
+          </div>
+          <Field label="Condo Fee /mo" value={p.condoFee} onChange={s("condoFee")} prefix="$" />
+
+          <div style={{marginBottom:11}}>
+            <label style={S.lbl}>Rental Income from this property?</label>
+            <div style={{display:"flex",gap:8}}>
+              <button style={S.tog(p.hasRental)} onClick={()=>setP(v=>({...v,hasRental:true}))}>Yes</button>
+              <button style={S.tog(!p.hasRental)} onClick={()=>setP(v=>({...v,hasRental:false}))}>No</button>
+            </div>
+          </div>
+          {p.hasRental && (
+            <div style={S.r2}>
+              <Field label="Monthly Rental Income" value={p.rentalMonthly} onChange={s("rentalMonthly")} prefix="$" />
+              <Field label="Vacancy Rate" value={p.vacancyRate} onChange={s("vacancyRate")} suffix="%" step="1" />
+            </div>
+          )}
+
+          <div style={S.div}/>
+          <div style={S.sec}>🏢 If You Rent Instead</div>
+          <Field label="Monthly Rent" value={p.rentMonthly} onChange={s("rentMonthly")} prefix="$" />
+          <div style={S.r2}>
+            <Field label="Utilities /mo" value={p.renterUtils} onChange={s("renterUtils")} prefix="$" />
+            <Field label="Annual Rent Increase" value={p.rentIncrease} onChange={s("rentIncrease")} suffix="%" step="0.1" />
+          </div>
+          <Field label="Investable Difference /mo" value={p.investableDiff} onChange={s("investableDiff")} prefix="$" />
+
+          <div style={S.div}/>
+          <div style={S.sec}>📈 Assumptions</div>
+          <div style={S.r2}>
+            <Field label="Home Appreciation /yr" value={p.homeAppreciation} onChange={s("homeAppreciation")} suffix="%" step="0.1" />
+            <Field label="Investment Return /yr" value={p.investReturn} onChange={s("investReturn")} suffix="%" step="0.1" />
+          </div>
+          <Field label="Time Horizon (years)" value={p.timeHorizon} onChange={s("timeHorizon")} suffix="yrs" step="1" min={1} />
+          <div style={{...S.info,fontSize:11,marginBottom:0}}>
+            Maintenance 1%/yr · Property Tax 0.75%/yr · Closing Costs 2% · Selling Costs 5%
+          </div>
+        </div>
+      </div>
+
+      {/* ── RESULTS ─────────────────────────────────────── */}
+      <div>
+        {/* Verdict */}
+        <div style={{
+          background:winner==="BUY"?`${C.accent}14`:`${C.gold}14`,
+          border:`1px solid ${winner==="BUY"?C.accent:C.gold}44`,
+          borderRadius:14, padding:"16px 20px", marginBottom:14,
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+        }}>
+          <div>
+            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:2}}>
+              Over {hor} Year{hor!==1?"s":""}
+            </div>
+            <div style={{fontSize:26,fontWeight:900,color:winner==="BUY"?C.accent:C.gold}}>
+              {winner==="BUY"?"🏡 Buying Wins":"🏢 Renting Wins"}
+            </div>
+            <div style={{fontSize:12,color:C.muted,marginTop:3}}>
+              Advantage: <strong style={{color:winner==="BUY"?C.accent:C.gold}}>{fmt(Math.abs(horizonRow?.diff??0))}</strong>
+            </div>
+          </div>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:0.5}}>
+              {breakEvenYear?"Buy beats rent in":"Rent wins all "+np.amortization+" yrs"}
+            </div>
+            {breakEvenYear && (
+              <>
+                <div style={{fontSize:46,fontWeight:900,color:C.accent,lineHeight:1}}>Yr {breakEvenYear}</div>
+                {breakEvenYear>hor && <div style={{fontSize:11,color:C.gold}}>After your horizon</div>}
+              </>
+            )}
+          </div>
+        </div>
+
+        <div style={S.g2}>
+          <div style={S.box(C.accent)}>
+            <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:2}}>Buy: Net Worth Change (Before Selling)</div>
+            <div style={{fontSize:22,fontWeight:800,color:horizonRow?.netWorthChange>=0?C.accent:C.red,letterSpacing:"-0.8px"}}>{fmt(horizonRow?.netWorthChange)}</div>
+            <div style={{fontSize:10,color:C.muted,marginTop:3}}>Equity Gain + Principal Paid + Down Payment − All Costs excl. Selling</div>
+          </div>
+          <div style={S.box(C.gold)}>
+            <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:2}}>Rent+Invest: Net Worth Change</div>
+            <div style={{fontSize:22,fontWeight:800,color:horizonRow?.netRent>=0?C.gold:C.red,letterSpacing:"-0.8px"}}>{fmt(horizonRow?.netRent)}</div>
+            <div style={{fontSize:10,color:C.muted,marginTop:3}}>Investment Value − Total Rent Paid</div>
+          </div>
+        </div>
+
+        <div style={S.g3}>
+          {[
+            {l:`Home Value After ${hor} Year${hor!==1?"s":""}`,                           v:horizonRow?.homeValue,  c:C.accent},
+            {l:"Net Buy (After Selling)",                                                   v:horizonRow?.netBuy,     c:C.accent},
+            {l:"Investment Value (Initial Down Payment + Investable Difference)",           v:horizonRow?.invValue,   c:C.gold},
+          ].map(({l,v,c})=>(
+            <div key={l} style={S.box(c)}>
+              <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:2}}>{l}</div>
+              <div style={{fontSize:15,fontWeight:800,color:c}}>{fmt(v)}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Chart */}
+        <div style={{...S.card,marginBottom:14}}>
+          <div style={S.sec}>Net Worth — Buy vs Rent+Invest ({np.amortization} Years)</div>
+          <ResponsiveContainer width="100%" height={195}>
+            <AreaChart data={rows} margin={{top:4,right:4,bottom:0,left:8}}>
+              <defs>
+                <linearGradient id="gB" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={C.accent} stopOpacity={0.25}/><stop offset="95%" stopColor={C.accent} stopOpacity={0}/>
+                </linearGradient>
+                <linearGradient id="gR" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={C.gold} stopOpacity={0.25}/><stop offset="95%" stopColor={C.gold} stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke={C.border}/>
+              <XAxis dataKey="year" stroke={C.muted} tick={{fontSize:10}}/>
+              <YAxis stroke={C.muted} tick={{fontSize:10}} tickFormatter={v=>`$${(v/1000).toFixed(0)}k`}/>
+              <Tooltip content={<Tip/>}/>
+              <Legend wrapperStyle={{fontSize:11,color:C.muted}}/>
+              <Area type="monotone" dataKey="netBuy"  name="Buy Net Worth"        stroke={C.accent} fill="url(#gB)" strokeWidth={2} dot={false}/>
+              <Area type="monotone" dataKey="netRent" name="Rent+Invest Net Worth" stroke={C.gold}  fill="url(#gR)" strokeWidth={2} dot={false}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Cost breakdown */}
+        <div style={{...S.card,marginBottom:14}}>
+          <div style={S.sec}>Cost Breakdown — Buying Over {hor} Year{hor!==1?"s":""}</div>
+          <div style={S.r2}>
+            {[
+              ["Interest Paid",       horizonRow?.interestPaid,  C.red],
+              ["Property Tax (0.75%)",horizonRow?.propTax,        "#FF8C42"],
+              ["Maintenance (1%/yr)", horizonRow?.maintenance,    C.gold],
+              ["Selling Costs (5%)",  horizonRow?.sellingCosts,   C.muted],
+              ["Utilities",           horizonRow?.utilsPaid,      "#9B8AFF"],
+              ["Home Insurance",      horizonRow?.insPaid,        C.blue],
+            ].map(([l,v,c])=>(
+              <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:`1px solid ${C.border}22`}}>
+                <span style={{fontSize:11,color:C.muted}}>{l}</span>
+                <span style={{fontSize:11,fontWeight:700,color:c}}>{fmt(v)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Table — rows = amortization years */}
+        <div style={S.card}>
+          <div style={S.sec}>
+            {np.amortization}-Year Breakdown
+            <span style={{color:C.accent,fontWeight:400,textTransform:"none",letterSpacing:0}}> — highlighted row = year {hor}</span>
+          </div>
+          <div style={{overflowX:"auto",maxHeight:460,overflowY:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead>
+                <tr>
+                  {[["Yr",true],["Home Value"],["Equity Appr."],["Principal"],["Interest"],["Rent Paid"],["Invest Value"],["Buy Net Buy (After Selling)"],["Rent Net Worth"],["Winner"]].map(([h,l])=>(
+                    <th key={h} style={S.th(l)}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(row=>(
+                  <tr key={row.year} style={{background:row.year===hor?`${C.accent}0E`:"transparent"}}>
+                    <td style={S.td(C.muted,true)}>{row.year}</td>
+                    <td style={S.td()}>{fmt(row.homeValue)}</td>
+                    <td style={S.td(C.accent)}>{fmt(row.equityAppr)}</td>
+                    <td style={S.td(C.accent)}>{fmt(row.principalPaid)}</td>
+                    <td style={S.td(C.red)}>{fmt(row.interestPaid)}</td>
+                    <td style={S.td(C.gold)}>{fmt(row.rentPaid)}</td>
+                    <td style={S.td(C.gold)}>{fmt(row.invValue)}</td>
+                    <td style={S.td(row.netBuy>=0?C.accent:C.red)}>{fmt(row.netBuy)}</td>
+                    <td style={S.td(row.netRent>=0?C.gold:C.red)}>{fmt(row.netRent)}</td>
+                    <td style={S.td()}><span style={S.pill(row.outcome==="BUY"?C.accent:C.gold)}>{row.outcome}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── AMORTIZATION TAB ─────────────────────────────────────────────────────────
+function AmortTab() {
+  const [p, setP] = useState({
+    loanAmount:603135, interestRate:4, amortization:25, term:5,
+    frequency:"Monthly", extraPayment:0, extraInterval:"Monthly",
+  });
+  const s = k => v => setP(prev=>({...prev,[k]:v}));
+
+  const result = useMemo(() => buildFullSchedule(
+    n(p.loanAmount), n(p.interestRate)/100, Math.max(1,n(p.amortization)),
+    Math.min(n(p.term),n(p.amortization)), p.frequency, n(p.extraPayment), p.extraInterval
+  ), [p]);
+
+  const baseInterest = useMemo(() => buildFullSchedule(
+    n(p.loanAmount), n(p.interestRate)/100, Math.max(1,n(p.amortization)),
+    Math.max(1,n(p.amortization)), "Monthly", 0
+  ).totalInterest, [p.loanAmount, p.interestRate, p.amortization]);
+
+  const saving = Math.max(0, baseInterest - result.totalInterest);
+  const yrsSaved = Math.max(0, n(p.amortization) - result.actualN / result.ppy);
+
+  return (
+    <div style={S.grid}>
+      <div>
+        <div style={S.card}>
+          <div style={S.sec}>🏦 Mortgage Details</div>
+          <Field label="Loan Amount" value={p.loanAmount} onChange={s("loanAmount")} prefix="$"/>
+          <div style={S.r2}>
+            <Field label="Interest Rate" value={p.interestRate} onChange={s("interestRate")} suffix="%" step="0.01"/>
+            <Field label="Amortization (yrs)" value={p.amortization} onChange={s("amortization")} step="1" min={1}/>
+          </div>
+          <div style={S.r2}>
+            <Field label="Term (yrs)" value={p.term} onChange={s("term")} step="1" min={1}/>
+          </div>
+          <Sel label="Payment Frequency" value={p.frequency} onChange={s("frequency")}
+            options={["Monthly","Semi-Monthly","Bi-Weekly","Weekly","Acc Bi-Weekly","Acc Weekly"]}/>
+          <div style={S.info}>
+            Scheduled Payment: <strong style={{color:C.accent}}>{fmt(result.scheduledPmt)}</strong> per period<br/>
+            Total # of Payments: <strong>{result.nper}</strong> ({n(p.amortization)} yrs)
+          </div>
+          <div style={S.div}/>
+          <div style={S.sec}>💰 Extra Payments</div>
+          <Field label="Extra Payment Amount" value={p.extraPayment} onChange={s("extraPayment")} prefix="$"/>
+          <Sel label="Extra Payment Interval" value={p.extraInterval} onChange={s("extraInterval")}
+            options={["Monthly","Annually","Bi-Weekly"]}/>
+          {n(p.extraPayment)>0 && (
+            <div style={{...S.info,color:C.accent}}>
+              Interest Savings: <strong>{fmt(saving)}</strong><br/>
+              Time Saved: <strong>{yrsSaved.toFixed(1)} years</strong> ({Math.round(yrsSaved*12)} payments)
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div>
+        <div style={S.g3}>
+          {[
+            {l:"Scheduled Payment",   v:fmt(result.scheduledPmt)+"/period", c:C.accent},
+            {l:"Balance at Term End", v:fmt(result.termBalance),             c:C.gold},
+            {l:"Interest Paid (Term)",v:fmt(result.termInterest),            c:C.red},
+          ].map(({l,v,c})=>(
+            <div key={l} style={S.box(c)}>
+              <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:3}}>{l}</div>
+              <div style={{fontSize:15,fontWeight:800,color:c}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        <div style={S.g3}>
+          {[
+            {l:"Principal Paid (Term)",  v:fmt(result.termPrin),                               c:C.accent},
+            {l:"Total Interest (Full)",  v:fmt(result.totalInterest),                          c:C.red},
+            {l:"Actual # of Payments",   v:`${result.actualN} (${(result.actualN/result.ppy).toFixed(1)} yrs)`, c:C.muted},
+          ].map(({l,v,c})=>(
+            <div key={l} style={S.box(c)}>
+              <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:3}}>{l}</div>
+              <div style={{fontSize:15,fontWeight:800,color:c}}>{v}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{...S.card,marginBottom:14}}>
+          <div style={S.sec}>Annual Principal vs Interest</div>
+          <ResponsiveContainer width="100%" height={195}>
+            <AreaChart data={result.yearlyChart} margin={{top:4,right:4,bottom:0,left:8}}>
+              <defs>
+                <linearGradient id="gP" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.accent} stopOpacity={0.3}/><stop offset="95%" stopColor={C.accent} stopOpacity={0}/></linearGradient>
+                <linearGradient id="gI" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.red} stopOpacity={0.3}/><stop offset="95%" stopColor={C.red} stopOpacity={0}/></linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke={C.border}/>
+              <XAxis dataKey="year" stroke={C.muted} tick={{fontSize:10}}/>
+              <YAxis stroke={C.muted} tick={{fontSize:10}} tickFormatter={v=>`$${(v/1000).toFixed(0)}k`}/>
+              <Tooltip content={<Tip/>}/>
+              <Legend wrapperStyle={{fontSize:11}}/>
+              <Area type="monotone" dataKey="principal" name="Principal" stroke={C.accent} fill="url(#gP)" strokeWidth={2} dot={false}/>
+              <Area type="monotone" dataKey="interest"  name="Interest"  stroke={C.red}   fill="url(#gI)" strokeWidth={2} dot={false}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div style={S.card}>
+          <div style={S.sec}>Payment Schedule (first 120 payments shown)</div>
+          <div style={{overflowX:"auto",maxHeight:420,overflowY:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead>
+                <tr>{[["#",true],["Payment"],["Extra"],["Interest"],["Principal"],["Balance"]].map(([h,l])=>(
+                  <th key={h} style={S.th(l)}>{h}</th>
+                ))}</tr>
+              </thead>
+              <tbody>
+                {result.payments.slice(0,120).map(row=>(
+                  <tr key={row.num}>
+                    <td style={S.td(C.muted,true)}>{row.num}</td>
+                    <td style={S.td()}>{fmt(row.payment)}</td>
+                    <td style={S.td(row.extra>0?C.accent:C.muted)}>{row.extra>0?fmt(row.extra):"—"}</td>
+                    <td style={S.td(C.red)}>{fmt(row.interest)}</td>
+                    <td style={S.td(C.accent)}>{fmt(row.principal)}</td>
+                    <td style={S.td(C.gold)}>{fmt(row.balance)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PRE-APPROVAL TAB ─────────────────────────────────────────────────────────
+function PATab() {
+  const [p, setP] = useState({income:160000,debt:0,dp:65000,rate:4,amort:25,propTax:406.25,heating:150,condo:0});
+  const s = k => v => setP(prev=>({...prev,[k]:v}));
+  const r = useMemo(()=>calcPA(n(p.income),n(p.debt),n(p.dp),n(p.rate)/100,n(p.amort),n(p.propTax),n(p.heating),n(p.condo)),[p]);
+  const gOk=r.gds<=0.39, tOk=r.tds<=0.44, dOk=n(p.dp)>=r.md;
+  const ok=gOk&&tOk&&dOk&&r.maxMortgage>0;
+  return (
+    <div style={S.grid}>
+      <div>
+        <div style={S.card}>
+          <div style={S.sec}>💰 Income & Debts</div>
+          <Field label="Annual Gross Income" value={p.income} onChange={s("income")} prefix="$"/>
+          <Field label="Monthly Debt Payments (car, loans, etc.)" value={p.debt} onChange={s("debt")} prefix="$"/>
+          <Field label="Down Payment Available" value={p.dp} onChange={s("dp")} prefix="$"/>
+          <div style={S.div}/>
+          <div style={S.sec}>🏦 Mortgage Terms</div>
+          <div style={S.r2}>
+            <Field label="Interest Rate" value={p.rate} onChange={s("rate")} suffix="%" step="0.01"/>
+            <Field label="Amortization (yrs)" value={p.amort} onChange={s("amort")} step="1"/>
+          </div>
+          <div style={S.info}>Stress Test Rate: <strong style={{color:C.text}}>{fmtPct(r.sr)}</strong> = max({n(p.rate)}% + 2%, 5.25%)</div>
+          <div style={S.div}/>
+          <div style={S.sec}>🏡 Est. Monthly Housing Costs</div>
+          <Field label="Property Tax /mo" value={p.propTax} onChange={s("propTax")} prefix="$"/>
+          <div style={S.r2}>
+            <Field label="Heating /mo" value={p.heating} onChange={s("heating")} prefix="$"/>
+            <Field label="Condo Fee /mo" value={p.condo} onChange={s("condo")} prefix="$"/>
+          </div>
+          <div style={S.info}>Total housing costs: <strong style={{color:C.text}}>{fmt(n(p.propTax)+n(p.heating)+n(p.condo))}/mo</strong></div>
+        </div>
+      </div>
+      <div>
+        <div style={{background:ok?`${C.accent}14`:`${C.red}14`,border:`1px solid ${ok?C.accent:C.red}44`,borderRadius:14,padding:"18px 22px",marginBottom:14,display:"flex",alignItems:"center",gap:16}}>
+          <div style={{fontSize:42}}>{ok?"✅":"⚠️"}</div>
+          <div>
+            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:2}}>Pre-Approval Status</div>
+            <div style={{fontSize:22,fontWeight:900,color:ok?C.accent:C.red}}>{ok?"Likely Approvable":"Review Required"}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:2}}>Canadian lender GDS/TDS ratios · stress test rate</div>
+          </div>
+        </div>
+        <div style={S.g2}>
+          <div style={S.box(C.accent)}><div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:2}}>Max Purchase Price</div><div style={{fontSize:22,fontWeight:800,color:C.accent}}>{fmt(r.maxPrice)}</div></div>
+          <div style={S.box(C.gold)}><div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:2}}>Max Mortgage</div><div style={{fontSize:22,fontWeight:800,color:C.gold}}>{fmt(r.maxMortgage)}</div></div>
+        </div>
+        <div style={S.g3}>
+          {[{l:"Monthly Payment",v:fmt(r.actualPmt)+"/mo",c:C.accent},{l:"Qualifying Payment",v:fmt(r.qualPmt)+"/mo",c:C.gold},{l:"Min Down Required",v:fmt(r.md),c:C.muted}].map(({l,v,c})=>(
+            <div key={l} style={S.box(c)}><div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,marginBottom:2}}>{l}</div><div style={{fontSize:14,fontWeight:800,color:c}}>{v}</div></div>
+          ))}
+        </div>
+        <div style={{...S.card,marginBottom:14}}>
+          <div style={S.sec}>Debt Service Ratios (Stress Test Rate)</div>
+          {[{l:"GDS",v:r.gds,lim:0.39,ok:gOk,d:"Housing costs ÷ income · max 39%"},{l:"TDS",v:r.tds,lim:0.44,ok:tOk,d:"All debts ÷ income · max 44%"}].map(({l,v,lim,ok:o,d})=>(
+            <div key={l} style={{marginBottom:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                <div><div style={{fontSize:13,fontWeight:700}}>{l} — {d}</div></div>
+                <div style={{textAlign:"right"}}><div style={{fontSize:18,fontWeight:800,color:o?C.accent:C.red}}>{fmtPct(v)}</div><div style={{fontSize:10,color:C.muted}}>limit {fmtPct(lim)}</div></div>
+              </div>
+              <div style={{background:C.inputBg,borderRadius:6,height:9,overflow:"hidden"}}>
+                <div style={{width:`${Math.min(v/lim*100,100)}%`,height:"100%",borderRadius:6,background:o?`linear-gradient(90deg,${C.accent},#00FF99)`:`linear-gradient(90deg,#FF8C42,${C.red})`,transition:"width .3s"}}/>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={S.card}>
+          <div style={S.sec}>Readiness Checklist</div>
+          {[
+            {l:"GDS ≤ 39%",                     p:gOk, v:`${fmtPct(r.gds)} / 39%`},
+            {l:"TDS ≤ 44%",                     p:tOk, v:`${fmtPct(r.tds)} / 44%`},
+            {l:"Down payment ≥ minimum",         p:dOk, v:`${fmt(n(p.dp))} / ${fmt(r.md)}`},
+            {l:"Closing costs estimate",          p:true,v:fmt(r.closingCosts)},
+            {l:"CMHC Insurance",                 p:true,v:r.cmhc>0?`${fmt(r.cmhc)} added to mortgage`:"Not required ✓"},
+          ].map(({l,p:pass,v})=>(
+            <div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${C.border}22`}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:14}}>{pass?"✅":"❌"}</span><span style={{fontSize:12,color:pass?C.text:C.red}}>{l}</span></div>
+              <span style={{fontSize:11,color:C.muted,fontWeight:600}}>{v}</span>
+            </div>
+          ))}
+          <div style={{...S.info,marginTop:12,marginBottom:0,fontSize:11}}>⚠️ Illustrative only. Consult a licensed mortgage professional.</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── APP ROOT ─────────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState("rvb");
+  return (
+    <div style={S.app}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
+      <div style={S.hdr}>
+        <div style={{display:"flex",alignItems:"center",gap:11}}>
+          <div style={S.logo}>⌂</div>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,letterSpacing:"-0.5px"}}>HomeIQ Planner</div>
+            <div style={{fontSize:10,color:C.muted}}>by Canadian Financial Literacy · @canadianfinancialliteracy</div>
+          </div>
+        </div>
+        <div style={S.tabs}>
+          <button style={S.tab(tab==="rvb")}   onClick={()=>setTab("rvb")}>Rent vs Buy</button>
+          <button style={S.tab(tab==="amort")} onClick={()=>setTab("amort")}>Amortization</button>
+          <button style={S.tab(tab==="pa")}    onClick={()=>setTab("pa")}>Pre-Approval</button>
+        </div>
+      </div>
+      <div style={S.main}>
+        {tab==="rvb"   && <RVBTab/>}
+        {tab==="amort" && <AmortTab/>}
+        {tab==="pa"    && <PATab/>}
+      </div>
+      <div style={{textAlign:"center",padding:"16px",borderTop:`1px solid ${C.border}`,fontSize:11,color:C.muted}}>
+        Created by Nitin Kochhar · For illustrative purposes only · Actual lender results may differ
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+  </script>
+</body>
 </html>
